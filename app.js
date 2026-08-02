@@ -262,6 +262,21 @@
   }
 
   /* ====== 文章页 ====== */
+  function lazyVideos(root) {
+    var vids = root.querySelectorAll("video.kb-video");
+    if (!vids.length) return;
+    if (!("IntersectionObserver" in window)) return; // 不支持则保持默认 preload
+    vids.forEach(function (v) { v.setAttribute("preload", "none"); });
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        var v = e.target;
+        if (e.isIntersecting) { v.setAttribute("preload", "metadata"); io.unobserve(v); }
+        else if (!v.paused) { v.pause(); }
+      });
+    }, { rootMargin: "300px 0px", threshold: 0.01 });
+    vids.forEach(function (v) { io.observe(v); });
+  }
+
   function showPage(id) {
     var p = pages[id];
     if (!p) { showHome(); return; }
@@ -291,6 +306,8 @@
       "</header>" +
       '<div class="pv-body">' + p.html + "</div>" +
       (deptId ? '<a class="article-back-link" href="#/d/' + deptId + '">← 返回「' + esc(deptTitle) + "」</a>" : "");
+
+    lazyVideos(articleEl);
 
     [navEl, mobileNavEl].forEach(function (nav) {
       Array.prototype.forEach.call(nav.querySelectorAll(".active"), function (n) { n.classList.remove("active"); });
