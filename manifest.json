@@ -1,0 +1,18 @@
+{
+  "name": "小安的手术配合知识库",
+  "short_name": "手术配合知识库",
+  "description": "手术室护士的手术配合知识库：各专科手术配合要点、专家习惯、器械图谱、教学视频与手术图片。",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4f7fa",
+  "theme_color": "#15788a",
+  "lang": "zh-CN",
+  "categories": ["medical", "education", "productivity"],
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
