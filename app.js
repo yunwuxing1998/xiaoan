@@ -27,7 +27,7 @@
       }
       if (n.children) {
         if (n.id) childOf[n.id] = n.children.map(function (c) { return c.id; });
-        walk(n.children, n.id);
+        walk(n.children, n);
       }
     });
   })(tree);
@@ -312,7 +312,9 @@
   /* ====== 导航交互 ====== */
   function openNav() { body.classList.add("nav-open"); }
   function closeNav() { body.classList.remove("nav-open"); }
-  $("#menuBtn").addEventListener("click", openNav);
+  $("#menuBtn").addEventListener("click", function () {
+    if (body.classList.contains("nav-open")) closeNav(); else openNav();
+  });
   overlay.addEventListener("click", closeNav);
   // 移动端抽屉里点链接后自动收起
   mobileNavEl.addEventListener("click", function (e) {
