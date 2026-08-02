@@ -7,7 +7,7 @@
  * 核心文件（html/js/css/manifest）已改为「网络优先」，正常情况下无需手动升版本号，
  * 升版本号仅用于清掉历史遗留的旧缓存。
  */
-const KB_VERSION = "kb-v13";
+const KB_VERSION = "kb-v14";
 const CACHE = KB_VERSION;
 const CORE = ["./", "./index.html", "./styles.css", "./app.js", "./data.js",
               "./manifest.json", "./icon-192.png", "./icon-512.png"];

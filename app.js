@@ -322,9 +322,9 @@
   /* ====== 路由 ====== */
   function route() {
     var h = location.hash || "";
-    var pm = h.match(/^#\/p\/([0-9a-f]+)$/);
+    var pm = h.match(/^#\/p\/([^/]+)$/);
     if (pm && pages[pm[1]]) { showPage(pm[1]); return; }
-    var dm = h.match(/^#\/d\/([0-9a-f]+)$/);
+    var dm = h.match(/^#\/d\/([^/]+)$/);
     if (dm && pages[dm[1]]) { renderDept(dm[1]); return; }
     renderHome();
   }
