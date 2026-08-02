@@ -535,6 +535,13 @@ body.nav-open .overlay { display: block; }
   .menu-btn { display: block; }
   /* 文章页内的侧边栏在移动端由全局抽屉替代 */
   .article-layout .sidebar { display: none; }
+  /* Notion 多列（class="column" 带内联 width:X%）：手机上改为整列纵向堆叠，
+     否则图片被列宽压成手机屏的一小块。!important 覆盖内联 style 的宽度。 */
+  .column {
+    width: 100% !important;
+    max-width: 100% !important;
+    display: block !important;
+  }
   .mobile-drawer {
     display: block;
     position: fixed;
