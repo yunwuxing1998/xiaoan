@@ -1,1 +1,58 @@
-D:\工作空间-10-17-19-06-48\-同步\同步-Notion
+name: notion-sync
+
+# 小安知识库：Notion → 站点自动同步
+# 每 30 分钟轮询一次 Notion，内容有变化才提交并推送，GitHub Pages 随后自动重新部署。
+# 手动触发入口：Actions → notion-sync → Run workflow（可填 full=1 完整重建 / dry=1 演练）
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "完整重建（下载新媒体 + 清理孤儿文件）"
+        required: false
+        default: "0"
+      dry:
+        description: "演练模式（只跑不写盘，用于首次验证）"
+        required: false
+        default: "0"
+
+concurrency:
+  group: notion-sync
+  取消-进行中: 假
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    运行-在: ubuntu-最新版
+    steps:
+      - name: 检出仓库
+        使用: actions/checkout@v4
+
+      - 名称: 安装 Node 22
+        使用: actions/setup-node@v4
+        with:
+          node-版本: "22"
+
+      - 名称: 从 Notion 同步内容
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          FULL_SYNC: ${{ github.event.inputs.full || '0' }}
+          DRY_RUN: ${{ github.event.inputs.dry || '0' }}
+        运行: node scripts/sync-notion.mjs
+
+      - 名称: 有变化才提交并推送
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data.js assets/
+          if git diff --cached --quiet; then
+            echo "内容无变化，跳过提交。"
+          else
+            git commit -m "chore: Notion 自动同步 $(date -u '+%Y-%m-%d %H:%M') UTC"
+            git push
+            echo "已提交并推送，GitHub Pages 将自动重新部署（约 1 分钟）。"
+          fi
