@@ -10,6 +10,8 @@
  *   - 站点树完全按 Notion 结构重建：网站结构 = Notion 结构（层级/顺序/移动/删除即时反映）
  *   - 无媒体页面（纯文字/链接）→ 整页按最新 Notion 内容重建
  *   - 有媒体页面（含图片/视频）→ 只同步文字，媒体节点原样保留（零重复下载）
+ *   - 无媒体页/新页面在 Notion 出现新媒体（图片/视频/文件）→ 自动只升级该页为
+ *     full 渲染并下载这些新媒体，无需整站 FULL_SYNC=1；此后该页按媒体页合并保留
  *   - Notion 新增页面 → 自动进树（图标取 Notion 页面 emoji；旧树已有图标按 id 继承）
  *   - removed.txt（脚本同目录，每行一个 Notion 页面 id，`#` 注释）：
  *     列出的页面整棵子树从站点彻底移除（树 + pages 内容），用于网站侧永久删除
@@ -259,6 +261,7 @@ async function downloadMedia(url, kind, nameHint) {
     mediaCache.set(fname, null);
     return null;
   }
+  if (!existsSync(ASSETS_DIR)) mkdirSync(ASSETS_DIR, { recursive: true }); // 增量模式的新媒体自动升级也可能触发下载
   writeFileSync(join(ASSETS_DIR, fname), buf);
   mediaCache.set(fname, fname);
   if (kind === "image") makeW800(fname);
@@ -778,13 +781,34 @@ export async function main() {
     for (const s of ctx.skipped) stats.skippedTypes[s] = (stats.skippedTypes[s] || 0) + 1;
 
     const existing = pages[nid];
+    const hasMedia = existing
+      ? /<figure[\s>]|<video[\s>]|<img[^>]+src="assets\//i.test(existing.html || "")
+      : false;
+
+    // 鸡生蛋修复：无媒体页（含从未同步过的新页面）在 Notion 里出现新媒体时，
+    // 增量模式下只把这一页升级为 full 渲染——下载的仅是这一页的新媒体
+    // （已存在文件由 downloadMedia 的 existsSync 短路，不重复下载）。
+    // 渲染后该页带上媒体节点，此后同步即按媒体页走合并保留，不再依赖整站 FULL_SYNC=1。
+    // 下载失败时该块渲染为空、本页维持文字版，下次同步自动重试（自愈）。
+    if (!FULL && !hasMedia && ctx.newMedia.length) {
+      const kinds = {};
+      for (const m of ctx.newMedia) kinds[m.kind] = (kinds[m.kind] || 0) + 1;
+      const desc = Object.entries(kinds)
+        .map(([k, n]) => `${n} 个${k === "image" ? "图片" : k === "video" ? "视频" : "文件"}`)
+        .join("、");
+      log(`[新媒体] ${np.title}：Notion 新增 ${desc}，自动下载写入`);
+      try {
+        html = await renderBlocks(np.blocks, { mode: "full", newMedia: [], skipped: [] });
+        ctx.newMedia = []; // 已处理，不再计入 newMediaWarn
+      } catch (e) {
+        warn(`[新媒体升级失败] ${np.title}: ${e.message} — 本页维持文字版，下次同步重试`);
+      }
+    }
+
     if (existing) {
-      const hasMedia = /<figure[\s>]|<video[\s>]|<img[^>]+src="assets\//i.test(existing.html || "");
       let newHtml;
-      if (!hasMedia) {
-        newHtml = html; // 纯文字页：整页重建
-      } else if (FULL) {
-        newHtml = html; // 完整重建（媒体已重新下载）
+      if (!hasMedia || FULL) {
+        newHtml = html;
       } else {
         newHtml = mergeHtml(existing.html, html); // 媒体页：文字合并、媒体保留
       }
@@ -874,7 +898,7 @@ export async function main() {
   if (stats.removed.length) log("移除（removed.txt 黑名单，整棵子树）: " + stats.removed.join("、"));
   if (stats.failed.length) log("失败: " + stats.failed.join("、"));
   if (stats.newMediaWarn.length) {
-    log("新媒体提醒（增量模式不下载，FULL 重建后显示）:");
+    log("新媒体提醒（有媒体页新增的媒体，增量不下载，FULL 重建后显示；无媒体页/新页面已自动下载）:");
     stats.newMediaWarn.forEach((l) => log(l));
   }
   if (stats.legacy.length) {
