@@ -7,9 +7,14 @@
  *
  * 行为：
  *   - 递归遍历 Notion 根页面（ROOT_ID）下的全部页面
+ *   - 站点树完全按 Notion 结构重建：网站结构 = Notion 结构（层级/顺序/移动/删除即时反映）
  *   - 无媒体页面（纯文字/链接）→ 整页按最新 Notion 内容重建
  *   - 有媒体页面（含图片/视频）→ 只同步文字，媒体节点原样保留（零重复下载）
- *   - Notion 新增页面 → 自动挂进站点树
+ *   - Notion 新增页面 → 自动进树（图标取 Notion 页面 emoji；旧树已有图标按 id 继承）
+ *   - removed.txt（脚本同目录，每行一个 Notion 页面 id，`#` 注释）：
+ *     列出的页面整棵子树从站点彻底移除（树 + pages 内容），用于网站侧永久删除
+ *   - 仅存在于网站的旧页面（Notion 已无）：内容保留在 pages 可直链访问，但不进树；
+ *     确认不要时把 id 加进 removed.txt 即可彻底删除
  *   - 完整重建模式 FULL_SYNC=1：重下全部媒体（按文件路径哈希命名，可重复运行）、清理孤儿文件
  *   - 无变化不写文件、不产生提交
  *
@@ -18,6 +23,7 @@
  *   FULL_SYNC=1    完整重建（含媒体下载与孤儿清理），默认 0
  *   DRY_RUN=1      只演练不写盘，默认 0
  *   REPO_ROOT      站点仓库根目录（含 data.js 与 assets/），默认取脚本所在仓库根
+ *   REMOVED_FILE   黑名单文件路径，默认脚本同目录 removed.txt
  */
 
 import { createHash } from "node:crypto";
@@ -58,6 +64,24 @@ function warn(...a) { console.warn(...a); }
 function die(msg) { console.error("FATAL: " + msg); process.exit(1); }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function norm(id) { return String(id).replace(/-/g, ""); }
+
+/**
+ * removed.txt — 网站侧永久删除黑名单（与脚本同目录，随仓库版本走）。
+ * 每行一个 Notion 页面 id（带横线不带都行），`#` 开头为注释、空行忽略。
+ * 列出的页面：整棵子树不进站点树，pages 中的旧内容一并删除。
+ */
+const REMOVED_FILE = process.env.REMOVED_FILE || join(__dirname, "removed.txt");
+const REMOVED = (() => {
+  const set = new Set();
+  if (!existsSync(REMOVED_FILE)) return set;
+  for (const line of readFileSync(REMOVED_FILE, "utf8").split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s || s.startsWith("#")) continue;
+    set.add(norm(s));
+  }
+  return set;
+})();
+if (REMOVED.size) log(`removed.txt 黑名单生效：${REMOVED.size} 个页面子树将从站点移除`);
 
 function nowStr() {
   // 与线上 data.js 历史格式一致：YYYY-MM-DD HH:mm:ss（北京时间）
@@ -156,7 +180,10 @@ async function getPageMeta(id) {
     if (v.type === "multi_select") tags.push(...v.multi_select.map((x) => x.name).filter(Boolean));
     if (v.type === "select" && v.select) tags.push(v.select.name);
   }
-  return { title, tags };
+  // 页面图标（emoji 型；外部/文件型图标不采集，树上沿用旧图标或默认）
+  let icon = "";
+  if (p.icon && p.icon.type === "emoji") icon = p.icon.emoji || "";
+  return { title, tags, icon };
 }
 
 /* ---------------- 媒体（FULL 模式） ---------------- */
@@ -590,24 +617,66 @@ async function fetchNode(id) {
   return node;
 }
 
+/** 递归收集子树下所有页面 normId（removed.txt 删除 pages 旧内容用） */
+function collectSubtreeIds(node, acc) {
+  for (const cp of node.children) {
+    acc.add(norm(cp.id));
+    collectSubtreeIds(cp, acc);
+  }
+}
+
+/** misc 节点的子页面全被 removed.txt 清掉时，把空 misc 节点从树里摘除 */
+export function dropEmptyMisc(tree, miscNode) {
+  if (!miscNode || miscNode.children.length) return;
+  const i = tree.indexOf(miscNode);
+  if (i >= 0) tree.splice(i, 1);
+}
+
 /**
- * 展平为 normId -> { id, title, parent, blocks }
- * 「一些资料」容器页的子页面 parent 记为 MISC_NODE_ID（合成节点）。
+ * 单次遍历 Notion 结构，同时产出两样东西（网站结构 = Notion 结构）：
+ *   1) ctx.out: normId -> { id, title, parent, blocks } —— 待同步页面（removed.txt 子树除外）
+ *   2) outChildren 数组 —— 按 Notion 层级与顺序重建的站点树
+ * 规则：
+ *   - 「一些资料」容器页（标题命中、旧树中不是真实节点、自身无 pages 条目）不建页面条目，
+ *     其子页面挂到合成 misc 节点下（懒创建，位置跟随容器所在层级）
+ *   - removed.txt 中的 id：整棵子树跳过（不进树、不进 out；调用方负责删 pages 旧内容）
+ *   - 旧树 icon 按 id 继承（ctx.oldIcons）；新页面 icon 由同步循环经 getPageMeta 回填
  */
-function collectPages(node, parentNorm, out, parentMap, nodeById, pages) {
+export function walkNotion(node, parentNorm, outChildren, ctx) {
   for (const cp of node.children) {
     const nid = norm(cp.id);
-    const isContainer = cpTitle(cp) === MISC_CONTAINER_TITLE
-      && !nodeById.has(nid) && !pages[nid];
+    const title = cpTitle(cp);
+    if (ctx.removed.has(nid)) {
+      ctx.removedIds.add(nid);
+      collectSubtreeIds(cp, ctx.removedIds);
+      ctx.removedTitles.push(`${title} [${nid}]`);
+      continue; // 整棵子树移除
+    }
+    const isContainer = title === MISC_CONTAINER_TITLE
+      && !ctx.oldNodeIds.has(nid) && !ctx.pages[nid];
     if (isContainer) {
-      // 该容器不是站点页面：递归其子页面，父级记为合成 misc 节点
-      parentMap.set(nid, MISC_NODE_ID);
-      collectPages(cp, MISC_NODE_ID, out, parentMap, nodeById, pages);
+      if (!cp.children.length) continue; // 空容器不占位
+      if (!ctx.misc) {
+        const m = { id: MISC_NODE_ID, title: MISC_CONTAINER_TITLE };
+        const miscIcon = ctx.oldIcons.get(MISC_NODE_ID);
+        if (miscIcon) m.icon = miscIcon;
+        m.children = [];
+        ctx.misc = m;
+        outChildren.push(m);
+      }
+      walkNotion(cp, MISC_NODE_ID, ctx.misc.children, ctx);
       continue;
     }
-    out.set(nid, { id: cp.id, title: cpTitle(cp), parent: parentNorm, blocks: cp.blocks });
-    parentMap.set(nid, parentNorm);
-    collectPages(cp, nid, out, parentMap, nodeById, pages);
+    ctx.out.set(nid, { id: cp.id, title, parent: parentNorm, blocks: cp.blocks });
+    const child = { id: nid, title };
+    const icon = ctx.oldIcons.get(nid);
+    if (icon) child.icon = icon;
+    ctx.newNodeById.set(nid, child);
+    outChildren.push(child);
+    if (cp.children.length) {
+      child.children = [];
+      walkNotion(cp, nid, child.children, ctx);
+    }
   }
 }
 
@@ -618,7 +687,7 @@ function cpTitle(cp) {
 }
 
 /* ---------------- 主流程 ---------------- */
-async function main() {
+export async function main() {
   if (!TOKEN) {
     die("缺少环境变量 NOTION_TOKEN。\n" +
       "本地仓库 Settings → Secrets and variables → Actions → New repository secret，name 填 NOTION_TOKEN。");
@@ -630,8 +699,7 @@ async function main() {
   log(`读取 ${DATA_FILE}`);
   const { data, prefix, suffix, raw } = loadData();
   const pages = data.pages;
-  const tree = data.tree;
-  const before = JSON.stringify({ pages, tree });
+  const before = JSON.stringify({ pages, tree: data.tree });
 
   log(`遍历 Notion 根页面 ${ROOT_ID} ...`);
   const rootNode = await fetchNode(ROOT_ID);
@@ -646,26 +714,55 @@ async function main() {
     node.children.forEach(fill);
   })(rootNode);
 
-  // 树节点索引（增量挂载 + 容器判定用）
-  const nodeById = new Map();
-  (function index(nodes) {
+  // 旧树索引：icon 按 id 继承（防整站图标丢失）；oldNodeIds 用于容器判定
+  const oldIcons = new Map();
+  const oldNodeIds = new Set();
+  (function indexOld(nodes) {
     for (const n of nodes) {
-      if (n.id) nodeById.set(n.id, n);
-      if (n.children) index(n.children);
+      if (n.id) {
+        const nid = norm(n.id);
+        oldNodeIds.add(nid);
+        if (n.icon) oldIcons.set(nid, n.icon);
+      }
+      if (n.children) indexOld(n.children);
     }
-  })(tree);
-  const miscNode = nodeById.get(MISC_NODE_ID) || null;
+  })(data.tree);
 
-  const notionPages = new Map();
-  const parentMap = new Map();
-  collectPages(rootNode, norm(ROOT_ID), notionPages, parentMap, nodeById, pages);
-  log(`Notion 共 ${notionPages.size} 个页面`);
+  // 单次遍历 Notion：重建站点树 + 收集待同步页面
+  const walkCtx = {
+    out: new Map(),           // normId -> { id, title, parent, blocks }
+    pages,                    // 容器判定：有页面条目的「一些资料」视为真实页面
+    removed: REMOVED,
+    removedIds: new Set(),    // removed.txt 命中的全部子树 id（删 pages 旧内容用）
+    removedTitles: [],        // 日志用：标题 [id]
+    oldIcons,
+    oldNodeIds,
+    newNodeById: new Map(),   // 新树 normId -> node（新页面 icon/标题回写用）
+    misc: null,               // 合成 misc 节点（懒创建）
+  };
+  const newTree = [];
+  walkNotion(rootNode, norm(ROOT_ID), newTree, walkCtx);
+  // 容器子页面全被 removed.txt 清掉时，不留下空 misc 节点
+  dropEmptyMisc(newTree, walkCtx.misc);
+  // 黑名单里但 Notion 已没有的 id（先在 Notion 删了、后又想起删网站内容的）：
+  // 遍历不到，但 pages 旧内容同样要删；标题从旧 pages 取，保证日志可读
+  for (const nid of REMOVED) {
+    walkCtx.removedIds.add(nid);
+    if (pages[nid] && !walkCtx.removedTitles.some((t) => t.endsWith(`[${nid}]`))) {
+      walkCtx.removedTitles.push(`${pages[nid].title || nid} [${nid}]`);
+    }
+  }
+  const notionPages = walkCtx.out;
+  log(`Notion 共 ${notionPages.size} 个页面，站点树按 Notion 结构重建（顶层 ${newTree.length} 个节点）`);
+  if (!notionPages.size) {
+    die("Notion 遍历结果为空：根页面无权访问或结构异常，已中止（保留原 data.js，不清空树）。");
+  }
 
   const stats = {
     rebuilt: [], merged: [], added: [], unchanged: [],
-    failed: [], newMediaWarn: [], orphanInNotion: [], skippedTypes: {},
+    removed: walkCtx.removedTitles, // removed.txt 黑名单移除（整棵子树）
+    failed: [], newMediaWarn: [], legacy: [], skippedTypes: {},
   };
-  const addedNids = new Set(); // 新增页面的 normId（挂树用）
 
   // 逐页同步
   for (const [nid, np] of notionPages) {
@@ -710,49 +807,42 @@ async function main() {
     } else {
       // 新页面
       let tags = [];
-      if (!FULL) { // FULL 模式下也取属性（保持一致）
-        try {
-          const meta = await getPageMeta(np.id);
-          if (meta.title) np.title = meta.title;
-          tags = meta.tags;
-        } catch (e) {
-          warn(`[新页面属性失败] ${np.title}: ${e.message}`);
+      try { // 新页面取属性（增量/完整两种模式都取，保持一致）
+        const meta = await getPageMeta(np.id);
+        if (meta.title) np.title = meta.title;
+        tags = meta.tags;
+        const tn = walkCtx.newNodeById.get(nid);
+        if (tn) {
+          if (np.title) tn.title = np.title; // 树上标题以页面属性为准
+          if (meta.icon && !tn.icon) tn.icon = meta.icon;
         }
+      } catch (e) {
+        warn(`[新页面属性失败] ${np.title}: ${e.message}`);
       }
       pages[nid] = { title: np.title || "未命名", html, tags, text: textOf(html).slice(0, 6000) };
-      addedNids.add(nid);
       stats.added.push(np.title || nid);
     }
   }
 
-  // 挂载新页面到树（notionPages 为插入顺序，父先于子）
-  function findAttachTarget(parentNorm) {
-    if (parentNorm === norm(ROOT_ID)) return null; // 顶层
-    if (nodeById.has(parentNorm)) return nodeById.get(parentNorm);
-    let p = parentMap.get(parentNorm);
-    while (p) {
-      if (nodeById.has(p)) return nodeById.get(p);
-      if (p === norm(ROOT_ID)) return null;
-      p = parentMap.get(p);
-    }
-    return miscNode; // 找不到祖先 → 挂「一些资料」
-  }
-  for (const nid of addedNids) {
-    const np = notionPages.get(nid);
-    const target = findAttachTarget(np.parent);
-    const node = { id: nid, title: np.title || "未命名" };
-    if (target) { (target.children ||= []).push(node); }
-    else tree.push(node);
-    nodeById.set(nid, node);
+  // 站点树整体重建：网站结构 = Notion 结构
+  data.tree = newTree;
+
+  // removed.txt 黑名单：删掉这些页面在 pages 里的旧内容（新树已不含）
+  for (const nid of walkCtx.removedIds) {
+    if (pages[nid]) delete pages[nid];
   }
 
-  // Notion 中已删除的页面（保留内容，仅提示）
+  // 仅存在于网站的旧页面（Notion 已无）：内容保留在 pages 可直链访问，但不进树；
+  // 确认不要时把 id 加进 removed.txt，下次同步彻底删除
+  const miscNorm = norm(MISC_NODE_ID);
   for (const pid of Object.keys(pages)) {
-    if (!notionPages.has(pid)) stats.orphanInNotion.push(pages[pid].title || pid);
+    if (pid === miscNorm) continue;            // 合成节点「一些资料」着陆页
+    if (walkCtx.removedIds.has(pid)) continue; // 黑名单已删
+    if (!notionPages.has(pid)) stats.legacy.push(`${pages[pid].title || pid} [${pid}]`);
   }
 
   // 汇总 meta
-  const after = JSON.stringify({ pages, tree });
+  const after = JSON.stringify({ pages, tree: data.tree });
   const contentChanged = before !== after;
   let pruned = 0;
   if (FULL) {
@@ -777,17 +867,20 @@ async function main() {
 
   // 汇总日志
   log("\n========== 同步结果 ==========");
-  log(`整页重建 ${stats.rebuilt.length} | 文字合并 ${stats.merged.length} | 新增 ${stats.added.length} | 未变化 ${stats.unchanged.length} | 失败 ${stats.failed.length}`);
+  log(`整页重建 ${stats.rebuilt.length} | 文字合并 ${stats.merged.length} | 新增 ${stats.added.length} | 移除 ${stats.removed.length} | 未变化 ${stats.unchanged.length} | 失败 ${stats.failed.length}`);
   if (stats.rebuilt.length) log("重建: " + stats.rebuilt.join("、"));
   if (stats.merged.length) log("合并: " + stats.merged.join("、"));
   if (stats.added.length) log("新增: " + stats.added.join("、"));
+  if (stats.removed.length) log("移除（removed.txt 黑名单，整棵子树）: " + stats.removed.join("、"));
   if (stats.failed.length) log("失败: " + stats.failed.join("、"));
   if (stats.newMediaWarn.length) {
     log("新媒体提醒（增量模式不下载，FULL 重建后显示）:");
     stats.newMediaWarn.forEach((l) => log(l));
   }
-  if (stats.orphanInNotion.length) {
-    log(`Notion 中已删除的页面（内容保留、仅直链可达）: ${stats.orphanInNotion.join("、")}`);
+  if (stats.legacy.length) {
+    log(`仅存在于网站的旧页面（Notion 已无；内容保留、可直链访问，未进树）: ${stats.legacy.length} 个`);
+    for (const l of stats.legacy) log("  - " + l);
+    log("  确认不要时：把对应 id 加进 .github/workflows/removed.txt，下次同步彻底删除");
   }
   if (Object.keys(stats.skippedTypes).length) {
     log("跳过的块类型: " + Object.entries(stats.skippedTypes).map(([k, v]) => `${k}×${v}`).join(", "));
