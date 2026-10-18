@@ -42,7 +42,7 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           FULL_SYNC: ${{ github.event.inputs.full || '0' }}
           DRY_RUN: ${{ github.event.inputs.dry || '0' }}
-        run: node scripts/sync-notion.mjs
+        run: node .github/workflows/sync-notion.mjs
 
       - name: 有变化才提交并推送
         run: |
