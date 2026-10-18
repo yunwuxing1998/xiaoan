@@ -25,26 +25,26 @@ concurrency:
 permissions:
   contents: write
 
-任务:
+jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - 名称: 检出仓库
-        使用: actions/checkout@v4
+      - name: 检出仓库
+        uses: actions/checkout@v4
 
-      - 名称: 安装 Node 22
-使用: aactions/setup-node@v4
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - 名称: 从 Notion 同步内容
+      - name: 从 Notion 同步内容
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           FULL_SYNC: ${{ github.event.inputs.full || '0' }}
           DRY_RUN: ${{ github.event.inputs.dry || '0' }}
         run: node scripts/sync-notion.mjs
 
-      - 名称: 有变化才提交并推送
+      - name: 有变化才提交并推送
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -56,4 +56,3 @@ permissions:
             git push
             echo "已提交并推送，GitHub Pages 将自动重新部署（约 1 分钟）。"
           fi
-
