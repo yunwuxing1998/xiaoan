@@ -1,0 +1,822 @@
+#!/usr/bin/env node
+/**
+ * sync-notion.mjs — 小安的手术配合知识库：Notion → 站点 data.js 自动同步
+ *
+ * 运行环境：GitHub Actions（ubuntu-latest + Node 22，零第三方依赖）
+ * 认证：环境变量 NOTION_TOKEN（仓库 Secret），直连 api.notion.com
+ *
+ * 行为：
+ *   - 递归遍历 Notion 根页面（ROOT_ID）下的全部页面
+ *   - 无媒体页面（纯文字/链接）→ 整页按最新 Notion 内容重建
+ *   - 有媒体页面（含图片/视频）→ 只同步文字，媒体节点原样保留（零重复下载）
+ *   - Notion 新增页面 → 自动挂进站点树
+ *   - 完整重建模式 FULL_SYNC=1：重下全部媒体（按文件路径哈希命名，可重复运行）、清理孤儿文件
+ *   - 无变化不写文件、不产生提交
+ *
+ * 环境变量：
+ *   NOTION_TOKEN   必填，Notion API 令牌
+ *   FULL_SYNC=1    完整重建（含媒体下载与孤儿清理），默认 0
+ *   DRY_RUN=1      只演练不写盘，默认 0
+ *   REPO_ROOT      站点仓库根目录（含 data.js 与 assets/），默认取脚本所在仓库根
+ */
+
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync, mkdirSync, readFileSync, writeFileSync,
+  readdirSync, unlinkSync, realpathSync,
+} from "node:fs";
+import { dirname, join, basename } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/* ---------------- 配置 ---------------- */
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = process.env.REPO_ROOT
+  ? process.env.REPO_ROOT
+  : join(__dirname, "..", "..");
+const DATA_FILE = join(REPO_ROOT, "data.js");
+const ASSETS_DIR = join(REPO_ROOT, "assets");
+
+/** 小安知识库 Notion 根页面 ID */
+const ROOT_ID = "28777417-bfd8-810a-9fac-cee132e6dc2a";
+/** 站点树里的合成节点「一些资料」（非真实 Notion 页面） */
+const MISC_NODE_ID = "misc0000000000000000000000000000";
+/** Notion 中「一些资料」容器页标题：其子页面挂到合成节点下 */
+const MISC_CONTAINER_TITLE = "一些资料";
+
+const NOTION_VERSION = "2022-06-28";
+const UA = "xiaoan-kb-sync/1.0 (+https://github.com/yunwuxing1998/xiaoan)";
+const MIN_CALL_INTERVAL = 340; // ms，Notion 限流约 3 req/s
+
+const TOKEN = process.env.NOTION_TOKEN || "";
+const FULL = process.env.FULL_SYNC === "1";
+const DRY = process.env.DRY_RUN === "1";
+
+/* ---------------- 基础工具 ---------------- */
+function log(...a) { console.log(...a); }
+function warn(...a) { console.warn(...a); }
+function die(msg) { console.error("FATAL: " + msg); process.exit(1); }
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function norm(id) { return String(id).replace(/-/g, ""); }
+
+function nowStr() {
+  // 与线上 data.js 历史格式一致：YYYY-MM-DD HH:mm:ss（北京时间）
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  const cn = new Date(d.getTime() + (d.getTimezoneOffset() + 480) * 60000);
+  return `${cn.getFullYear()}-${p(cn.getMonth() + 1)}-${p(cn.getDate())} ${p(cn.getHours())}:${p(cn.getMinutes())}:${p(cn.getSeconds())}`;
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function escAttr(s) { return esc(s).replace(/"/g, "&quot;"); }
+function plain(rt) { return (rt || []).map((t) => t.plain_text ?? "").join(""); }
+
+/** Notion 富文本 → 站点 HTML（颜色标注按线上惯例丢弃） */
+function inline(rt) {
+  return (rt || []).map((t) => {
+    let s = esc(t.plain_text ?? "");
+    const a = t.annotations || {};
+    if (a.code) s = `<code>${s}</code>`;
+    if (a.bold) s = `<strong>${s}</strong>`;
+    if (a.italic) s = `<em>${s}</em>`;
+    if (a.strikethrough) s = `<s>${s}</s>`;
+    if (a.underline) s = `<u>${s}</u>`;
+    if (t.href) s = `<a href="${escAttr(t.href)}">${s}</a>`;
+    return s;
+  }).join("");
+}
+
+/* ---------------- Notion API 层（可注入 mock 供单测） ---------------- */
+let apiMock = null; // 仅测试用
+export function __setApiMock(fn) { apiMock = fn; }
+
+let lastCallAt = 0;
+
+async function notionApi(path, attempt = 1) {
+  if (apiMock) return apiMock(path);
+  const gap = MIN_CALL_INTERVAL - (Date.now() - lastCallAt);
+  if (gap > 0) await sleep(gap);
+  lastCallAt = Date.now();
+  let res;
+  try {
+    res = await fetch(`https://api.notion.com/v1/${path}`, {
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        "Notion-Version": NOTION_VERSION,
+        "User-Agent": UA,
+      },
+      signal: AbortSignal.timeout(60000),
+    });
+  } catch (e) {
+    if (attempt >= 6) throw new Error(`网络错误 ${path}: ${e.message}`);
+    await sleep(1500 * attempt);
+    return notionApi(path, attempt + 1);
+  }
+  if (res.status === 429 || res.status >= 500) {
+    if (attempt >= 6) throw new Error(`Notion API ${path} -> HTTP ${res.status}，重试 6 次仍失败`);
+    const backoff = Math.min(30000, 1500 * 2 ** (attempt - 1));
+    warn(`  [限流/故障] HTTP ${res.status}，${backoff}ms 后第 ${attempt} 次重试: ${path}`);
+    await sleep(backoff);
+    return notionApi(path, attempt + 1);
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    if (res.status === 401) {
+      die(`Notion API 认证失败（401）。请检查仓库 Secret NOTION_TOKEN 是否正确、以及该集成是否有知识库根页面访问权限。\n  ${body.slice(0, 300)}`);
+    }
+    throw new Error(`Notion API ${path} -> HTTP ${res.status}: ${body.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+/** 分页拉取某块的全部子块 */
+async function getBlocks(id) {
+  const out = [];
+  let cursor = null;
+  do {
+    let p = `blocks/${id}/children?page_size=100`;
+    if (cursor) p += `&start_cursor=${encodeURIComponent(cursor)}`;
+    const d = await notionApi(p);
+    out.push(...(d.results || []));
+    cursor = d.has_more ? d.next_cursor : null;
+  } while (cursor);
+  return out;
+}
+
+/** 拉页面属性（标题 / 标签），仅新页面用 */
+async function getPageMeta(id) {
+  const p = await notionApi(`pages/${id}`);
+  let title = "";
+  const tags = [];
+  for (const v of Object.values(p.properties || {})) {
+    if (!v || typeof v !== "object") continue;
+    if (v.type === "title") title = plain(v.title);
+    if (v.type === "multi_select") tags.push(...v.multi_select.map((x) => x.name).filter(Boolean));
+    if (v.type === "select" && v.select) tags.push(v.select.name);
+  }
+  return { title, tags };
+}
+
+/* ---------------- 媒体（FULL 模式） ---------------- */
+const mediaCache = new Map(); // fname -> 已处理
+let imgCount = 0;
+
+/**
+ * 稳定哈希：Notion 文件链接的签名参数每次拉取都不同，取路径部分做 SHA1 前 10 位，
+ * 保证同一文件重复 FULL 同步得到同一文件名（可跳过重复下载）。
+ */
+function stableHash(url) {
+  const pathPart = String(url).split("?")[0];
+  return createHash("sha1").update(pathPart).digest("hex").slice(0, 10);
+}
+
+function extFrom(url, contentType) {
+  const ct = contentType || "";
+  if (/jpeg/.test(ct)) return "jpg";
+  if (/png/.test(ct)) return "png";
+  if (/gif/.test(ct)) return "gif";
+  if (/webp/.test(ct)) return "webp";
+  if (/svg/.test(ct)) return "svg";
+  if (/mp4/.test(ct)) return "mp4";
+  if (/pdf/.test(ct)) return "pdf";
+  const m = /\.([a-zA-Z0-9]{2,5})(?:[?#]|$)/.exec(String(url).split("?")[0]);
+  if (m) {
+    const e = m[1].toLowerCase();
+    if (["png", "jpg", "jpeg", "gif", "webp", "svg", "mp4", "pdf"].includes(e)) return e === "jpeg" ? "jpg" : e;
+  }
+  return "bin";
+}
+
+/** 生成 800px 宽变体（线上 picture/srcset 约定）；无 ImageMagick 时跳过 */
+function makeW800(fname) {
+  const w800 = fname.replace(/(\.\w+)$/, "-w800$1");
+  try {
+    execFileSync("convert", [join(ASSETS_DIR, fname), "-resize", "800x800>", "-quality", "82", join(ASSETS_DIR, w800)], {
+      timeout: 60000, stdio: "ignore",
+    });
+    return w800;
+  } catch {
+    return null;
+  }
+}
+
+/** 下载 Notion 媒体到 assets/，返回 (文件名 或 null) */
+async function downloadMedia(url, kind, nameHint) {
+  const hash = stableHash(url);
+  const prefix = kind === "image" ? "img" : kind === "video" ? "vid" : "doc";
+  const ext = extFrom(url, "");
+  const fname = `${prefix}_${hash}.${ext}`;
+  if (mediaCache.has(fname)) return mediaCache.get(fname);
+  if (existsSync(join(ASSETS_DIR, fname))) {
+    mediaCache.set(fname, fname);
+    return fname;
+  }
+  let res;
+  try {
+    res = await fetch(url, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(180000), redirect: "follow" });
+  } catch (e) {
+    warn(`  [媒体失败] ${fname}: ${e.message}`);
+    mediaCache.set(fname, null);
+    return null;
+  }
+  if (!res.ok) {
+    warn(`  [媒体失败] ${fname}: HTTP ${res.status}`);
+    mediaCache.set(fname, null);
+    return null;
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > 95 * 1024 * 1024) {
+    warn(`  [媒体跳过] ${fname}: ${(buf.length / 1048576).toFixed(1)}MB 超过 95MB 上限（GitHub 单文件限制风险）`);
+    mediaCache.set(fname, null);
+    return null;
+  }
+  writeFileSync(join(ASSETS_DIR, fname), buf);
+  mediaCache.set(fname, fname);
+  if (kind === "image") makeW800(fname);
+  imgCount += 1;
+  return fname;
+}
+
+function figCaption(captionRt) {
+  const c = inline(captionRt);
+  return c ? `<figcaption>${c}</figcaption>` : "";
+}
+
+/* ---------------- 块 → HTML 渲染器 ----------------
+ * 输出与线上 data.js 现有方言保持一致：
+ *   p / h2(一级标题) / h3(二三级) / ul.bulleted-list / ol.numbered-list /
+ *   table.simple-table / blockquote.kb-callout / details[open] /
+ *   div.column-list > div.column / p.kb-pagelink / figure.kb-figure / video.kb-video
+ * ctx.mode: "text"（丢弃媒体，交给合并逻辑保留旧媒体）| "full"（下载媒体）
+ */
+export async function renderBlocks(blocks, ctx) {
+  const out = [];
+  let list = null; // { kind: "ul" | "ol", items: [] }
+  const flush = async () => {
+    if (list) { out.push(await renderList(list, ctx)); list = null; }
+  };
+  for (const b of blocks) {
+    const t = b.type;
+    if (t === "bulleted_list_item" || t === "numbered_list_item" || t === "to_do") {
+      const kind = t === "numbered_list_item" ? "ol" : "ul";
+      if (!list || list.kind !== kind) { await flush(); list = { kind, items: [] }; }
+      list.items.push(b);
+      continue;
+    }
+    await flush();
+    const h = await renderBlock(b, ctx);
+    if (h) out.push(h);
+  }
+  await flush();
+  return out.join("\n");
+}
+
+async function renderList(list, ctx) {
+  const cls = list.kind === "ol" ? "numbered-list" : "bulleted-list";
+  const lis = [];
+  for (const it of list.items) {
+    const field = it.type === "to_do" ? "to_do" : it.type;
+    const prefix = it.type === "to_do" ? (it.to_do?.checked ? "[x] " : "[ ] ") : "";
+    const txt = prefix + inline(it[field]?.rich_text);
+    const sub = it.has_children ? "\n" + await renderBlocks(await getBlocks(it.id), ctx) : "";
+    lis.push(`<li>${txt}${sub}</li>`);
+  }
+  return `<${list.kind} class="${cls}">${lis.join("")}</${list.kind}>`;
+}
+
+async function renderTable(b, ctx) {
+  if (!b.has_children) return "";
+  const rows = (await getBlocks(b.id)).filter((r) => r.type === "table_row");
+  const rowHtml = (r, tag) =>
+    `<tr>${(r.table_row?.cells || []).map((c) => `<${tag}>${inline(c)}</${tag}>`).join("")}</tr>`;
+  const head = b.table?.has_column_header && rows.length
+    ? `<thead class="simple-table-header">${rowHtml(rows.shift(), "th")}</thead>` : "";
+  const body = rows.length ? `<tbody>${rows.map((r) => rowHtml(r, "td")).join("")}</tbody>` : "";
+  return `<table class="simple-table" dir="ltr">${head}${body}</table>`;
+}
+
+function countMedia(b, ctx, kind) {
+  ctx.newMedia.push({ kind, id: norm(b.id), title: "" });
+  return "";
+}
+
+async function renderBlock(b, ctx) {
+  const t = b.type;
+  switch (t) {
+    case "paragraph": {
+      const h = inline(b.paragraph?.rich_text);
+      return h ? `<p>${h}</p>` : "";
+    }
+    case "heading_1": return `<h2>${inline(b.heading_1?.rich_text)}</h2>`;
+    case "heading_2":
+    case "heading_3": return `<h3>${inline(b[t]?.rich_text)}</h3>`;
+    case "quote": return `<blockquote>${inline(b.quote?.rich_text)}</blockquote>`;
+    case "callout": {
+      const inner = b.has_children ? await renderBlocks(await getBlocks(b.id), ctx) : "";
+      return `<blockquote class="kb-callout">${inner}</blockquote>`;
+    }
+    case "code":
+      return `<pre><code>${esc(plain(b.code?.rich_text))}</code></pre>`;
+    case "divider":
+      return "";
+    case "bulleted_list_item":
+    case "numbered_list_item":
+    case "to_do":
+      return await renderList({ kind: t === "numbered_list_item" ? "ol" : "ul", items: [b] }, ctx);
+    case "table":
+      return await renderTable(b, ctx);
+    case "toggle": {
+      const summary = inline(b.toggle?.rich_text);
+      const inner = b.has_children ? await renderBlocks(await getBlocks(b.id), ctx) : "";
+      return `<details open><summary>${summary}</summary>${inner}</details>`;
+    }
+    case "column_list": {
+      const inner = b.has_children ? await renderBlocks(await getBlocks(b.id), ctx) : "";
+      return inner ? `<div class="column-list">${inner}</div>` : "";
+    }
+    case "column": {
+      const inner = b.has_children ? await renderBlocks(await getBlocks(b.id), ctx) : "";
+      return `<div class="column" style="width:50%">${inner}</div>`;
+    }
+    case "synced_block": {
+      if (!b.has_children) return "";
+      return await renderBlocks(await getBlocks(b.id), ctx);
+    }
+    case "child_page": {
+      const title = b.child_page?.title || "未命名";
+      return `<p class="kb-pagelink"><a href="#/p/${norm(b.id)}">${esc(title)}</a></p>`;
+    }
+    case "bookmark":
+    case "link_preview":
+    case "embed": {
+      const url = b[t]?.url || "";
+      return url ? `<p><a href="${escAttr(url)}">${esc(url)}</a></p>` : "";
+    }
+    case "image": {
+      if (ctx.mode !== "full") return countMedia(b, ctx, "image");
+      const im = b.image || {};
+      const url = (im.type === "file" ? im.file?.url : im.external?.url) || "";
+      if (!url) return countMedia(b, ctx, "image");
+      const fname = await downloadMedia(url, "image");
+      if (!fname) return "";
+      const w800 = existsSync(join(ASSETS_DIR, fname.replace(/(\.\w+)$/, "-w800$1")))
+        ? fname.replace(/(\.\w+)$/, "-w800$1") : null;
+      const cap = figCaption(im.caption);
+      const alt = esc(plain(im.caption) || "image");
+      const pic = w800
+        ? `<picture><source media="(max-width: 860px)" srcset="assets/${w800}"><img src="assets/${fname}" alt="${alt}" loading="lazy" decoding="async"></picture>`
+        : `<img src="assets/${fname}" alt="${alt}" loading="lazy" decoding="async">`;
+      return `<figure class="kb-figure">${pic}${cap}</figure>`;
+    }
+    case "video": {
+      if (ctx.mode !== "full") return countMedia(b, ctx, "video");
+      const vd = b.video || {};
+      const url = (vd.type === "file" ? vd.file?.url : vd.external?.url) || "";
+      if (!url) return countMedia(b, ctx, "video");
+      const fname = await downloadMedia(url, "video");
+      if (!fname) return "";
+      const type = fname.endsWith(".webm") ? "video/webm" : "video/mp4";
+      return `<figure class="kb-figure"><video controls preload="metadata" class="kb-video" playsinline><source src="assets/${fname}" type="${type}"/>${figCaption(vd.caption)}</video></figure>`;
+    }
+    case "file":
+    case "pdf": {
+      if (ctx.mode !== "full") return countMedia(b, ctx, "pdf");
+      const fb = b[t] || {};
+      const url = (fb.type === "file" ? fb.file?.url : fb.external?.url) || "";
+      if (!url) return countMedia(b, ctx, "pdf");
+      const fname = await downloadMedia(url, "file");
+      if (!fname) return "";
+      const name = fb.name || fb.file?.name || plain(fb.caption) || basename(String(url).split("?")[0]);
+      return `<p class="kb-file"><a href="assets/${fname}" target="_blank" rel="noopener">\u{1F4CE} ${esc(name)}</a></p>`;
+    }
+    case "table_row":
+      return ""; // 由 table 统一处理
+    case "child_database":
+    case "link_to_page":
+    case "template":
+    case "breadcrumb":
+    case "table_of_contents":
+    case "unsupported":
+      ctx.skipped.push(t);
+      return "";
+    default: {
+      const body = b[t] || {};
+      if (Array.isArray(body.rich_text)) return `<p>${inline(body.rich_text)}</p>`;
+      ctx.skipped.push(t);
+      return "";
+    }
+  }
+}
+
+/* ---------------- 媒体保留合并（移植自线上 sync_notion.py，已对拍验证） ---------------- */
+const CONTAINER_TAGS = new Set([
+  "h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "table", "details",
+  "blockquote", "aside", "figure", "div", "picture", "section", "span",
+]);
+
+function findClose(html, start, tag) {
+  const pat = new RegExp(`<${tag}\\b[^>]*?(/?)>|</${tag}\\s*>`, "gs");
+  pat.lastIndex = start;
+  let depth = 0;
+  let m;
+  while ((m = pat.exec(html)) !== null) {
+    if (m[0].startsWith("</")) {
+      depth -= 1;
+      if (depth === 0) return m.index + m[0].length;
+    } else if (m[1] === "/") {
+      if (depth === 0) return m.index + m[0].length;
+    } else {
+      depth += 1;
+    }
+  }
+  return html.length;
+}
+
+function tokenizeMedia(html) {
+  const media = [];
+  let h = html.replace(/<figure[^>]*>.*?<\/figure>/gs, (m0) => { media.push(m0); return `@@MED${media.length}@@`; });
+  h = h.replace(/<video[^>]*>.*?<\/video>/gs, (m0) => { media.push(m0); return `@@MED${media.length}@@`; });
+  h = h.replace(/<img[^>]+src="assets\/[^>]*>/g, (m0) => { media.push(m0); return `@@MED${media.length}@@`; });
+  const cols = [];
+  const colOpen = /<div\b[^>]*class="column-list"[^>]*>/g;
+  let pos = 0;
+  for (;;) {
+    colOpen.lastIndex = pos;
+    const m = colOpen.exec(h);
+    if (!m) break;
+    const end = findClose(h, m.index, "div");
+    if (end <= m.index) break;
+    cols.push(h.slice(m.index, end));
+    h = h.slice(0, m.index) + `@@COL${cols.length}@@` + h.slice(end);
+    pos = m.index + 8;
+  }
+  const openPat = /<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*?(\/?)>/g;
+  const skipTags = new Set(["br", "hr", "img", "source", "input", "video", "figure", "picture"]);
+  let guard = 0;
+  while (guard < 300) {
+    guard += 1;
+    let absorbed = false;
+    openPat.lastIndex = 0;
+    let m;
+    while ((m = openPat.exec(h)) !== null) {
+      const tag = m[1].toLowerCase();
+      if (m[2] === "/" || skipTags.has(tag)) continue;
+      const end = findClose(h, m.index, tag);
+      const blk = h.slice(m.index, end);
+      if (blk.includes("@@MED") || blk.includes("@@COL")) {
+        media.push(blk);
+        h = h.slice(0, m.index) + `@@MED${media.length}@@` + h.slice(end);
+        absorbed = true;
+        break;
+      }
+    }
+    if (!absorbed) break;
+  }
+  return [h, media, cols];
+}
+
+function parseSegs(html) {
+  const segs = [];
+  const tagRe = /<([a-zA-Z][a-zA-Z0-9]*)((?:\s[^<>]*)?)(\/?)>/;
+  let i = 0;
+  const n = html.length;
+  while (i < n) {
+    const mm = /^@@(MED|COL)(\d+)@@/.exec(html.slice(i));
+    if (mm) {
+      segs.push([mm[1] === "MED" ? "media" : "col", Number(mm[2])]);
+      i += mm[0].length;
+      continue;
+    }
+    if (html[i] !== "<") {
+      let nxt = html.indexOf("<", i);
+      if (nxt < 0) nxt = n;
+      const chunk = html.slice(i, nxt);
+      if (chunk.trim()) segs.push(["text", chunk]);
+      i = nxt;
+      continue;
+    }
+    const tm = tagRe.exec(html.slice(i));
+    if (!tm) { segs.push(["text", html[i]]); i += 1; continue; }
+    const tag = tm[1].toLowerCase();
+    if (tm[3] === "/" || !CONTAINER_TAGS.has(tag)) {
+      segs.push(["text", tm[0]]);
+      i += tm[0].length;
+      continue;
+    }
+    const end = findClose(html, i, tag);
+    segs.push(["text", html.slice(i, end)]);
+    i = end;
+  }
+  return segs;
+}
+
+function substTokens(s, media, cols) {
+  for (let k = 0; k < 6; k++) {
+    if (!s.includes("@@MED") && !s.includes("@@COL")) break;
+    s = s.replace(/@@COL(\d+)@@/g, (_m, d) => cols[Number(d) - 1]);
+    s = s.replace(/@@MED(\d+)@@/g, (_m, d) => substTokens(media[Number(d) - 1], media, cols));
+  }
+  return s;
+}
+
+/** 把新文字合并进旧 HTML：旧媒体节点原位保留，文字块按序替换 */
+export function mergeHtml(oldHtml, newHtml) {
+  const [tok, media, cols] = tokenizeMedia(oldHtml);
+  const oldSegs = parseSegs(tok);
+  const newSegs = parseSegs(newHtml);
+  const newText = newSegs.filter((s) => s[0] === "text").map((s) => s[1]);
+  let ni = 0;
+  const res = [];
+  for (const [t, v] of oldSegs) {
+    if (t === "media") res.push(substTokens(media[v - 1], media, cols));
+    else if (t === "col") res.push(substTokens(cols[v - 1], media, cols));
+    else {
+      if (ni < newText.length) { res.push(newText[ni]); ni += 1; }
+      else res.push(v); // 新文字不够 → 保留旧文字，不丢内容
+    }
+  }
+  if (ni < newText.length) res.push(...newText.slice(ni)); // 多余新文字补到末尾
+  return res.join("");
+}
+
+/* ---------------- 纯文本提取（page.text 用） ---------------- */
+const ENTITY_MAP = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+};
+function unescapeEntities(s) {
+  return s.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (m, e) => {
+    if (e[0] === "#") {
+      const code = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+    }
+    return ENTITY_MAP[e] !== undefined ? ENTITY_MAP[e] : m;
+  });
+}
+
+export function textOf(html) {
+  let t = String(html || "").replace(/<(script|style)[^>]*>.*?<\/\1>/gs, "");
+  t = t.replace(/<[^>]+>/g, " ");
+  t = unescapeEntities(t);
+  t = t.replace(/[ \t]+/g, " ");
+  t = t.replace(/\n{2,}/g, "\n");
+  return t.trim();
+}
+
+/* ---------------- data.js 读写 ---------------- */
+function loadData() {
+  const raw = readFileSync(DATA_FILE, "utf8");
+  const eq = raw.indexOf("=");
+  if (eq < 0 || !raw.startsWith("window.KB_DATA")) die(`data.js 格式异常: ${DATA_FILE}`);
+  let json = raw.slice(eq + 1).trim();
+  if (json.endsWith(";")) json = json.slice(0, -1);
+  const data = JSON.parse(json);
+  const prefix = raw.slice(0, eq + 1); // "window.KB_DATA ="
+  const suffix = raw.endsWith("\n") ? "\n" : "";
+  return { data, prefix, suffix, raw };
+}
+
+/* ---------------- Notion 遍历 ---------------- */
+/** 递归拉取页面结构（含每页顶层 blocks，一次拉取两用） */
+async function fetchNode(id) {
+  const blocks = await getBlocks(id);
+  const node = { id, blocks, children: [] };
+  for (const b of blocks) {
+    if (b.type === "child_page") {
+      node.children.push(await fetchNode(b.id));
+    }
+  }
+  return node;
+}
+
+/**
+ * 展平为 normId -> { id, title, parent, blocks }
+ * 「一些资料」容器页的子页面 parent 记为 MISC_NODE_ID（合成节点）。
+ */
+function collectPages(node, parentNorm, out, parentMap, nodeById, pages) {
+  for (const cp of node.children) {
+    const nid = norm(cp.id);
+    const isContainer = cpTitle(cp) === MISC_CONTAINER_TITLE
+      && !nodeById.has(nid) && !pages[nid];
+    if (isContainer) {
+      // 该容器不是站点页面：递归其子页面，父级记为合成 misc 节点
+      parentMap.set(nid, MISC_NODE_ID);
+      collectPages(cp, MISC_NODE_ID, out, parentMap, nodeById, pages);
+      continue;
+    }
+    out.set(nid, { id: cp.id, title: cpTitle(cp), parent: parentNorm, blocks: cp.blocks });
+    parentMap.set(nid, parentNorm);
+    collectPages(cp, nid, out, parentMap, nodeById, pages);
+  }
+}
+
+function cpTitle(cp) {
+  // child_page 块本身不带标题；标题存在父级 blocks 的 child_page.title 中不可靠，
+  // 统一由调用方在展开时用块内 title（Notion child_page 块带 title 字段）。
+  return cp.blockTitle || "未命名";
+}
+
+/* ---------------- 主流程 ---------------- */
+async function main() {
+  if (!TOKEN) {
+    die("缺少环境变量 NOTION_TOKEN。\n" +
+      "本地仓库 Settings → Secrets and variables → Actions → New repository secret，name 填 NOTION_TOKEN。");
+  }
+  if (!existsSync(DATA_FILE)) die(`找不到 data.js: ${DATA_FILE}`);
+  if (FULL && !existsSync(ASSETS_DIR)) mkdirSync(ASSETS_DIR, { recursive: true });
+
+  log(`模式: ${FULL ? "完整重建（含媒体下载）" : "增量同步（保留媒体）"}${DRY ? " + DRY_RUN（不写盘）" : ""}`);
+  log(`读取 ${DATA_FILE}`);
+  const { data, prefix, suffix, raw } = loadData();
+  const pages = data.pages;
+  const tree = data.tree;
+  const before = JSON.stringify({ pages, tree });
+
+  log(`遍历 Notion 根页面 ${ROOT_ID} ...`);
+  const rootNode = await fetchNode(ROOT_ID);
+
+  // child_page 块带 title，回填到 node 上
+  (function fill(node) {
+    for (const b of node.blocks) {
+      if (b.type !== "child_page") continue;
+      const kid = node.children.find((c) => c.id === b.id);
+      if (kid) kid.blockTitle = b.child_page?.title || "未命名";
+    }
+    node.children.forEach(fill);
+  })(rootNode);
+
+  // 树节点索引（增量挂载 + 容器判定用）
+  const nodeById = new Map();
+  (function index(nodes) {
+    for (const n of nodes) {
+      if (n.id) nodeById.set(n.id, n);
+      if (n.children) index(n.children);
+    }
+  })(tree);
+  const miscNode = nodeById.get(MISC_NODE_ID) || null;
+
+  const notionPages = new Map();
+  const parentMap = new Map();
+  collectPages(rootNode, norm(ROOT_ID), notionPages, parentMap, nodeById, pages);
+  log(`Notion 共 ${notionPages.size} 个页面`);
+
+  const stats = {
+    rebuilt: [], merged: [], added: [], unchanged: [],
+    failed: [], newMediaWarn: [], orphanInNotion: [], skippedTypes: {},
+  };
+  const addedNids = new Set(); // 新增页面的 normId（挂树用）
+
+  // 逐页同步
+  for (const [nid, np] of notionPages) {
+    const ctx = { mode: FULL ? "full" : "text", newMedia: [], skipped: [] };
+    let html;
+    try {
+      html = await renderBlocks(np.blocks, ctx);
+    } catch (e) {
+      warn(`[渲染失败] ${np.title} (${nid}): ${e.message} — 保留旧内容`);
+      stats.failed.push(np.title);
+      continue;
+    }
+    for (const s of ctx.skipped) stats.skippedTypes[s] = (stats.skippedTypes[s] || 0) + 1;
+
+    const existing = pages[nid];
+    if (existing) {
+      const hasMedia = /<figure[\s>]|<video[\s>]|<img[^>]+src="assets\//i.test(existing.html || "");
+      let newHtml;
+      if (!hasMedia) {
+        newHtml = html; // 纯文字页：整页重建
+      } else if (FULL) {
+        newHtml = html; // 完整重建（媒体已重新下载）
+      } else {
+        newHtml = mergeHtml(existing.html, html); // 媒体页：文字合并、媒体保留
+      }
+      const newText = textOf(newHtml).slice(0, 6000);
+      const titleChanged = np.title && np.title !== existing.title;
+      if (existing.html === newHtml && existing.text === newText && !titleChanged) {
+        stats.unchanged.push(np.title);
+        if (ctx.newMedia.length && !FULL) {
+          stats.newMediaWarn.push(`  ${np.title}: Notion 新增 ${ctx.newMedia.length} 个媒体（需 FULL 重建后显示）`);
+        }
+        continue;
+      }
+      existing.html = newHtml;
+      existing.text = newText;
+      if (np.title) existing.title = np.title;
+      (hasMedia && !FULL ? stats.merged : stats.rebuilt).push(np.title);
+      if (ctx.newMedia.length && !FULL) {
+        stats.newMediaWarn.push(`  ${np.title}: Notion 新增 ${ctx.newMedia.length} 个媒体（需 FULL 重建后显示）`);
+      }
+    } else {
+      // 新页面
+      let tags = [];
+      if (!FULL) { // FULL 模式下也取属性（保持一致）
+        try {
+          const meta = await getPageMeta(np.id);
+          if (meta.title) np.title = meta.title;
+          tags = meta.tags;
+        } catch (e) {
+          warn(`[新页面属性失败] ${np.title}: ${e.message}`);
+        }
+      }
+      pages[nid] = { title: np.title || "未命名", html, tags, text: textOf(html).slice(0, 6000) };
+      addedNids.add(nid);
+      stats.added.push(np.title || nid);
+    }
+  }
+
+  // 挂载新页面到树（notionPages 为插入顺序，父先于子）
+  function findAttachTarget(parentNorm) {
+    if (parentNorm === norm(ROOT_ID)) return null; // 顶层
+    if (nodeById.has(parentNorm)) return nodeById.get(parentNorm);
+    let p = parentMap.get(parentNorm);
+    while (p) {
+      if (nodeById.has(p)) return nodeById.get(p);
+      if (p === norm(ROOT_ID)) return null;
+      p = parentMap.get(p);
+    }
+    return miscNode; // 找不到祖先 → 挂「一些资料」
+  }
+  for (const nid of addedNids) {
+    const np = notionPages.get(nid);
+    const target = findAttachTarget(np.parent);
+    const node = { id: nid, title: np.title || "未命名" };
+    if (target) { (target.children ||= []).push(node); }
+    else tree.push(node);
+    nodeById.set(nid, node);
+  }
+
+  // Notion 中已删除的页面（保留内容，仅提示）
+  for (const pid of Object.keys(pages)) {
+    if (!notionPages.has(pid)) stats.orphanInNotion.push(pages[pid].title || pid);
+  }
+
+  // 汇总 meta
+  const after = JSON.stringify({ pages, tree });
+  const contentChanged = before !== after;
+  let pruned = 0;
+  if (FULL) {
+    const referenced = new Set();
+    for (const p of Object.values(pages)) {
+      for (const m of String(p.html || "").matchAll(/(?:src|href)="(assets\/[^"]+)"/g)) referenced.add(m[1]);
+    }
+    for (const f of readdirSync(ASSETS_DIR)) {
+      if (!referenced.has(`assets/${f}`)) {
+        try { unlinkSync(join(ASSETS_DIR, f)); pruned += 1; } catch { /* 忽略 */ }
+      }
+    }
+  }
+
+  if (contentChanged || pruned > 0) {
+    const allHtml = Object.values(pages).map((p) => p.html || "").join("");
+    data.meta.count = Object.keys(pages).length;
+    data.meta.media = (allHtml.match(/<img\b/gi) || []).length + (allHtml.match(/<video\b/gi) || []).length;
+    data.meta.source = "Notion 知识库";
+    data.meta.generatedAt = nowStr();
+  }
+
+  // 汇总日志
+  log("\n========== 同步结果 ==========");
+  log(`整页重建 ${stats.rebuilt.length} | 文字合并 ${stats.merged.length} | 新增 ${stats.added.length} | 未变化 ${stats.unchanged.length} | 失败 ${stats.failed.length}`);
+  if (stats.rebuilt.length) log("重建: " + stats.rebuilt.join("、"));
+  if (stats.merged.length) log("合并: " + stats.merged.join("、"));
+  if (stats.added.length) log("新增: " + stats.added.join("、"));
+  if (stats.failed.length) log("失败: " + stats.failed.join("、"));
+  if (stats.newMediaWarn.length) {
+    log("新媒体提醒（增量模式不下载，FULL 重建后显示）:");
+    stats.newMediaWarn.forEach((l) => log(l));
+  }
+  if (stats.orphanInNotion.length) {
+    log(`Notion 中已删除的页面（内容保留、仅直链可达）: ${stats.orphanInNotion.join("、")}`);
+  }
+  if (Object.keys(stats.skippedTypes).length) {
+    log("跳过的块类型: " + Object.entries(stats.skippedTypes).map(([k, v]) => `${k}×${v}`).join(", "));
+  }
+  if (FULL) log(`FULL: 下载媒体 ${imgCount} 个，清理孤儿文件 ${pruned} 个`);
+  log(`meta: count=${data.meta.count} media=${data.meta.media} generatedAt=${data.meta.generatedAt}`);
+
+  if (!contentChanged && pruned === 0) {
+    log("\n内容无变化，不写文件、不产生提交。");
+    return;
+  }
+  if (DRY) {
+    log("\nDRY_RUN=1：内容有变化，但按设置不写盘。");
+    return;
+  }
+  const out = prefix + JSON.stringify(data) + ";" + suffix;
+  writeFileSync(DATA_FILE, out, "utf8");
+  log(`\n已写入 ${DATA_FILE}（${(out.length / 1024).toFixed(0)} KB）`);
+}
+
+/* ---------------- 入口 ---------------- */
+const isMain = (() => {
+  try {
+    return process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch { return false; }
+})();
+if (isMain) {
+  main().catch((e) => {
+    console.error("FATAL: " + (e?.stack || e?.message || e));
+    process.exit(1);
+  });
+}
