@@ -10,6 +10,10 @@
  *   - 站点树完全按 Notion 结构重建：网站结构 = Notion 结构（层级/顺序/移动/删除即时反映）
  *   - 无媒体页面（纯文字/链接）→ 整页按最新 Notion 内容重建
  *   - 有媒体页面（含图片/视频）→ 只同步文字，媒体节点原样保留（零重复下载）
+ *   - 媒体合并 parseSegs 会把文本段中嵌入的 @@MED/@@COL 占位符拆出成独立媒体段
+ *     （2026-10-18 修复：此前第 2 个起的连续媒体 token 被吞进文本段，合并时
+ *     要么被新文字整段替换（静默丢媒体）、要么原样保留（@@MED 泄漏到线上）；
+ *     另加保险丝：合并结果仍含 token 时该页自动升级完整重建）
  *   - 无媒体页/新页面在 Notion 出现新媒体（图片/视频/文件）→ 自动只升级该页为
  *     full 渲染并下载这些新媒体，无需整站 FULL_SYNC=1；此后该页按媒体页合并保留
  *   - Notion 新增页面 → 自动进树（图标取 Notion 页面 emoji；旧树已有图标按 id 继承）
@@ -523,7 +527,21 @@ function parseSegs(html) {
       let nxt = html.indexOf("<", i);
       if (nxt < 0) nxt = n;
       const chunk = html.slice(i, nxt);
-      if (chunk.trim()) segs.push(["text", chunk]);
+      // 文本段里可能嵌有连续的 @@MED/@@COL 占位符（顶层媒体块之间只隔空白时，
+      // 第 2 个起的 token 会被吞进同一个文本段）。必须先拆出来：
+      //  - 不拆 → 合并时整段被新文字替换 = 静默丢失媒体（页面"只剩一页内容"）；
+      //  - 不拆 → 新文字不够时整段原样保留 = 占位符泄漏到线上（@@MED2@@…）。
+      const tokRe = /@@(MED|COL)(\d+)@@/g;
+      let last = 0;
+      let tm2;
+      while ((tm2 = tokRe.exec(chunk)) !== null) {
+        const pre = chunk.slice(last, tm2.index);
+        if (pre.trim()) segs.push(["text", pre]);
+        segs.push([tm2[1] === "MED" ? "media" : "col", Number(tm2[2])]);
+        last = tm2.index + tm2[0].length;
+      }
+      const tail = chunk.slice(last);
+      if (tail.trim()) segs.push(["text", tail]);
       i = nxt;
       continue;
     }
@@ -545,8 +563,14 @@ function parseSegs(html) {
 function substTokens(s, media, cols) {
   for (let k = 0; k < 6; k++) {
     if (!s.includes("@@MED") && !s.includes("@@COL")) break;
-    s = s.replace(/@@COL(\d+)@@/g, (_m, d) => cols[Number(d) - 1]);
-    s = s.replace(/@@MED(\d+)@@/g, (_m, d) => substTokens(media[Number(d) - 1], media, cols));
+    s = s.replace(/@@COL(\d+)@@/g, (_m, d) => {
+      const c = cols[Number(d) - 1];
+      return c === undefined ? "" : substTokens(c, media, cols); // 越界 token（旧数据已损坏）→ 丢弃，不崩
+    });
+    s = s.replace(/@@MED(\d+)@@/g, (_m, d) => {
+      const m = media[Number(d) - 1];
+      return m === undefined ? "" : substTokens(m, media, cols); // 同上
+    });
   }
   return s;
 }
@@ -560,9 +584,13 @@ export function mergeHtml(oldHtml, newHtml) {
   let ni = 0;
   const res = [];
   for (const [t, v] of oldSegs) {
-    if (t === "media") res.push(substTokens(media[v - 1], media, cols));
-    else if (t === "col") res.push(substTokens(cols[v - 1], media, cols));
-    else {
+    if (t === "media") {
+      const m = media[v - 1];
+      res.push(m === undefined ? "" : substTokens(m, media, cols));
+    } else if (t === "col") {
+      const c = cols[v - 1];
+      res.push(c === undefined ? "" : substTokens(c, media, cols));
+    } else {
       if (ni < newText.length) { res.push(newText[ni]); ni += 1; }
       else res.push(v); // 新文字不够 → 保留旧文字，不丢内容
     }
@@ -807,10 +835,37 @@ export async function main() {
 
     if (existing) {
       let newHtml;
-      if (!hasMedia || FULL) {
+      let rebuiltByGuard = false;
+      // 旧数据污染（历史 bug 曾把 @@MED token 写进 data.js）：残留 token 的页面
+      // 无法靠合并自愈（媒体节点已不在旧 html 里），直接升级完整重建
+      const oldCorrupt = /@@(MED|COL)\d+@@/.test(existing.html || "");
+      if (!FULL && oldCorrupt) {
+        warn(`[旧数据损坏] ${np.title}：旧 html 残留占位符，本页升级为完整重建`);
+        try {
+          newHtml = await renderBlocks(np.blocks, { mode: "full", newMedia: [], skipped: [] });
+          rebuiltByGuard = true;
+          ctx.newMedia = []; // 媒体已进 html，不再计入 newMediaWarn
+        } catch (e) {
+          warn(`[完整重建失败] ${np.title}: ${e.message} — 保留旧内容，下次同步重试`);
+          newHtml = existing.html;
+        }
+      } else if (!hasMedia || FULL) {
         newHtml = html;
       } else {
         newHtml = mergeHtml(existing.html, html); // 媒体页：文字合并、媒体保留
+        // 保险丝：合并结果若仍残留占位符（异常嵌套等极端情况），
+        // 本页升级为完整重建——保证 @@MED/@@COL token 永远不落进 data.js
+        if (/@@(MED|COL)\d+@@/.test(newHtml)) {
+          warn(`[合并异常] ${np.title}：合并结果仍含占位符，本页升级为完整重建`);
+          try {
+            newHtml = await renderBlocks(np.blocks, { mode: "full", newMedia: [], skipped: [] });
+            rebuiltByGuard = true;
+            ctx.newMedia = [];
+          } catch (e) {
+            warn(`[完整重建失败] ${np.title}: ${e.message} — 保留旧内容，不下发损坏结果`);
+            newHtml = existing.html;
+          }
+        }
       }
       const newText = textOf(newHtml).slice(0, 6000);
       const titleChanged = np.title && np.title !== existing.title;
@@ -824,7 +879,7 @@ export async function main() {
       existing.html = newHtml;
       existing.text = newText;
       if (np.title) existing.title = np.title;
-      (hasMedia && !FULL ? stats.merged : stats.rebuilt).push(np.title);
+      (hasMedia && !FULL && !rebuiltByGuard ? stats.merged : stats.rebuilt).push(np.title);
       if (ctx.newMedia.length && !FULL) {
         stats.newMediaWarn.push(`  ${np.title}: Notion 新增 ${ctx.newMedia.length} 个媒体（需 FULL 重建后显示）`);
       }
