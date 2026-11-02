@@ -8,20 +8,17 @@
  * 行为：
  *   - 递归遍历 Notion 根页面（ROOT_ID）下的全部页面
  *   - 站点树完全按 Notion 结构重建：网站结构 = Notion 结构（层级/顺序/移动/删除即时反映）
- *   - 无媒体页面（纯文字/链接）→ 整页按最新 Notion 内容重建
- *   - 有媒体页面（含图片/视频）→ 只同步文字，媒体节点原样保留（零重复下载）
- *   - 媒体合并 parseSegs 会把文本段中嵌入的 @@MED/@@COL 占位符拆出成独立媒体段
- *     （2026-10-18 修复：此前第 2 个起的连续媒体 token 被吞进文本段，合并时
- *     要么被新文字整段替换（静默丢媒体）、要么原样保留（@@MED 泄漏到线上）；
- *     另加保险丝：合并结果仍含 token 时该页自动升级完整重建）
- *   - 无媒体页/新页面在 Notion 出现新媒体（图片/视频/文件）→ 自动只升级该页为
- *     full 渲染并下载这些新媒体，无需整站 FULL_SYNC=1；此后该页按媒体页合并保留
+ *   - 每页全量重建 HTML：媒体文件按内容哈希命名且已存在即跳过下载
+ *     （downloadMedia 的 existsSync 短路），因此常规运行零下载、只有新媒体才下载。
+ *     （2026-11-02 重构：废除旧"媒体保留合并"——其按位置对齐的合并会把纯文字
+ *     column-list 误判为媒体原样保留，新文字每轮被追加一份，导致线上大面积
+ *     内容重复且每轮滚雪球；全量重建从根源上消除对齐问题）
  *   - Notion 新增页面 → 自动进树（图标取 Notion 页面 emoji；旧树已有图标按 id 继承）
  *   - removed.txt（脚本同目录，每行一个 Notion 页面 id，`#` 注释）：
  *     列出的页面整棵子树从站点彻底移除（树 + pages 内容），用于网站侧永久删除
  *   - 仅存在于网站的旧页面（Notion 已无）：内容保留在 pages 可直链访问，但不进树；
  *     确认不要时把 id 加进 removed.txt 即可彻底删除
- *   - 完整重建模式 FULL_SYNC=1：重下全部媒体（按文件路径哈希命名，可重复运行）、清理孤儿文件
+ *   - FULL_SYNC=1：额外清理未被任何页面引用的孤儿媒体文件（缺失媒体每次运行都会自动补下）
  *   - 无变化不写文件、不产生提交
  *
  * 环境变量：
@@ -222,9 +219,10 @@ function extFrom(url, contentType) {
   return "bin";
 }
 
-/** 生成 800px 宽变体（线上 picture/srcset 约定）；无 ImageMagick 时跳过 */
+/** 生成 800px 宽变体（线上 picture/srcset 约定）；已存在则跳过；无 ImageMagick 时跳过 */
 function makeW800(fname) {
   const w800 = fname.replace(/(\.\w+)$/, "-w800$1");
+  if (existsSync(join(ASSETS_DIR, w800))) return w800;
   try {
     execFileSync("convert", [join(ASSETS_DIR, fname), "-resize", "800x800>", "-quality", "82", join(ASSETS_DIR, w800)], {
       timeout: 60000, stdio: "ignore",
@@ -283,7 +281,7 @@ function figCaption(captionRt) {
  *   p / h2(一级标题) / h3(二三级) / ul.bulleted-list / ol.numbered-list /
  *   table.simple-table / blockquote.kb-callout / details[open] /
  *   div.column-list > div.column / p.kb-pagelink / figure.kb-figure / video.kb-video
- * ctx.mode: "text"（丢弃媒体，交给合并逻辑保留旧媒体）| "full"（下载媒体）
+ * ctx.mode: 恒为 "full"（下载缺失媒体；已存在的媒体文件由 existsSync 短路跳过）
  */
 export async function renderBlocks(blocks, ctx) {
   const out = [];
@@ -329,11 +327,6 @@ async function renderTable(b, ctx) {
     ? `<thead class="simple-table-header">${rowHtml(rows.shift(), "th")}</thead>` : "";
   const body = rows.length ? `<tbody>${rows.map((r) => rowHtml(r, "td")).join("")}</tbody>` : "";
   return `<table class="simple-table" dir="ltr">${head}${body}</table>`;
-}
-
-function countMedia(b, ctx, kind) {
-  ctx.newMedia.push({ kind, id: norm(b.id), title: "" });
-  return "";
 }
 
 async function renderBlock(b, ctx) {
@@ -389,10 +382,9 @@ async function renderBlock(b, ctx) {
       return url ? `<p><a href="${escAttr(url)}">${esc(url)}</a></p>` : "";
     }
     case "image": {
-      if (ctx.mode !== "full") return countMedia(b, ctx, "image");
       const im = b.image || {};
       const url = (im.type === "file" ? im.file?.url : im.external?.url) || "";
-      if (!url) return countMedia(b, ctx, "image");
+      if (!url) return "";
       const fname = await downloadMedia(url, "image");
       if (!fname) return "";
       const w800 = existsSync(join(ASSETS_DIR, fname.replace(/(\.\w+)$/, "-w800$1")))
@@ -405,10 +397,9 @@ async function renderBlock(b, ctx) {
       return `<figure class="kb-figure">${pic}${cap}</figure>`;
     }
     case "video": {
-      if (ctx.mode !== "full") return countMedia(b, ctx, "video");
       const vd = b.video || {};
       const url = (vd.type === "file" ? vd.file?.url : vd.external?.url) || "";
-      if (!url) return countMedia(b, ctx, "video");
+      if (!url) return "";
       const fname = await downloadMedia(url, "video");
       if (!fname) return "";
       const type = fname.endsWith(".webm") ? "video/webm" : "video/mp4";
@@ -416,10 +407,9 @@ async function renderBlock(b, ctx) {
     }
     case "file":
     case "pdf": {
-      if (ctx.mode !== "full") return countMedia(b, ctx, "pdf");
       const fb = b[t] || {};
       const url = (fb.type === "file" ? fb.file?.url : fb.external?.url) || "";
-      if (!url) return countMedia(b, ctx, "pdf");
+      if (!url) return "";
       const fname = await downloadMedia(url, "file");
       if (!fname) return "";
       const name = fb.name || fb.file?.name || plain(fb.caption) || basename(String(url).split("?")[0]);
@@ -442,161 +432,6 @@ async function renderBlock(b, ctx) {
       return "";
     }
   }
-}
-
-/* ---------------- 媒体保留合并（移植自线上 sync_notion.py，已对拍验证） ---------------- */
-const CONTAINER_TAGS = new Set([
-  "h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "table", "details",
-  "blockquote", "aside", "figure", "div", "picture", "section", "span",
-]);
-
-function findClose(html, start, tag) {
-  const pat = new RegExp(`<${tag}\\b[^>]*?(/?)>|</${tag}\\s*>`, "gs");
-  pat.lastIndex = start;
-  let depth = 0;
-  let m;
-  while ((m = pat.exec(html)) !== null) {
-    if (m[0].startsWith("</")) {
-      depth -= 1;
-      if (depth === 0) return m.index + m[0].length;
-    } else if (m[1] === "/") {
-      if (depth === 0) return m.index + m[0].length;
-    } else {
-      depth += 1;
-    }
-  }
-  return html.length;
-}
-
-function tokenizeMedia(html) {
-  const media = [];
-  let h = html.replace(/<figure[^>]*>.*?<\/figure>/gs, (m0) => { media.push(m0); return `@@MED${media.length}@@`; });
-  h = h.replace(/<video[^>]*>.*?<\/video>/gs, (m0) => { media.push(m0); return `@@MED${media.length}@@`; });
-  h = h.replace(/<img[^>]+src="assets\/[^>]*>/g, (m0) => { media.push(m0); return `@@MED${media.length}@@`; });
-  const cols = [];
-  const colOpen = /<div\b[^>]*class="column-list"[^>]*>/g;
-  let pos = 0;
-  for (;;) {
-    colOpen.lastIndex = pos;
-    const m = colOpen.exec(h);
-    if (!m) break;
-    const end = findClose(h, m.index, "div");
-    if (end <= m.index) break;
-    cols.push(h.slice(m.index, end));
-    h = h.slice(0, m.index) + `@@COL${cols.length}@@` + h.slice(end);
-    pos = m.index + 8;
-  }
-  const openPat = /<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*?(\/?)>/g;
-  const skipTags = new Set(["br", "hr", "img", "source", "input", "video", "figure", "picture"]);
-  let guard = 0;
-  while (guard < 300) {
-    guard += 1;
-    let absorbed = false;
-    openPat.lastIndex = 0;
-    let m;
-    while ((m = openPat.exec(h)) !== null) {
-      const tag = m[1].toLowerCase();
-      if (m[2] === "/" || skipTags.has(tag)) continue;
-      const end = findClose(h, m.index, tag);
-      const blk = h.slice(m.index, end);
-      if (blk.includes("@@MED") || blk.includes("@@COL")) {
-        media.push(blk);
-        h = h.slice(0, m.index) + `@@MED${media.length}@@` + h.slice(end);
-        absorbed = true;
-        break;
-      }
-    }
-    if (!absorbed) break;
-  }
-  return [h, media, cols];
-}
-
-function parseSegs(html) {
-  const segs = [];
-  const tagRe = /<([a-zA-Z][a-zA-Z0-9]*)((?:\s[^<>]*)?)(\/?)>/;
-  let i = 0;
-  const n = html.length;
-  while (i < n) {
-    const mm = /^@@(MED|COL)(\d+)@@/.exec(html.slice(i));
-    if (mm) {
-      segs.push([mm[1] === "MED" ? "media" : "col", Number(mm[2])]);
-      i += mm[0].length;
-      continue;
-    }
-    if (html[i] !== "<") {
-      let nxt = html.indexOf("<", i);
-      if (nxt < 0) nxt = n;
-      const chunk = html.slice(i, nxt);
-      // 文本段里可能嵌有连续的 @@MED/@@COL 占位符（顶层媒体块之间只隔空白时，
-      // 第 2 个起的 token 会被吞进同一个文本段）。必须先拆出来：
-      //  - 不拆 → 合并时整段被新文字替换 = 静默丢失媒体（页面"只剩一页内容"）；
-      //  - 不拆 → 新文字不够时整段原样保留 = 占位符泄漏到线上（@@MED2@@…）。
-      const tokRe = /@@(MED|COL)(\d+)@@/g;
-      let last = 0;
-      let tm2;
-      while ((tm2 = tokRe.exec(chunk)) !== null) {
-        const pre = chunk.slice(last, tm2.index);
-        if (pre.trim()) segs.push(["text", pre]);
-        segs.push([tm2[1] === "MED" ? "media" : "col", Number(tm2[2])]);
-        last = tm2.index + tm2[0].length;
-      }
-      const tail = chunk.slice(last);
-      if (tail.trim()) segs.push(["text", tail]);
-      i = nxt;
-      continue;
-    }
-    const tm = tagRe.exec(html.slice(i));
-    if (!tm) { segs.push(["text", html[i]]); i += 1; continue; }
-    const tag = tm[1].toLowerCase();
-    if (tm[3] === "/" || !CONTAINER_TAGS.has(tag)) {
-      segs.push(["text", tm[0]]);
-      i += tm[0].length;
-      continue;
-    }
-    const end = findClose(html, i, tag);
-    segs.push(["text", html.slice(i, end)]);
-    i = end;
-  }
-  return segs;
-}
-
-function substTokens(s, media, cols) {
-  for (let k = 0; k < 6; k++) {
-    if (!s.includes("@@MED") && !s.includes("@@COL")) break;
-    s = s.replace(/@@COL(\d+)@@/g, (_m, d) => {
-      const c = cols[Number(d) - 1];
-      return c === undefined ? "" : substTokens(c, media, cols); // 越界 token（旧数据已损坏）→ 丢弃，不崩
-    });
-    s = s.replace(/@@MED(\d+)@@/g, (_m, d) => {
-      const m = media[Number(d) - 1];
-      return m === undefined ? "" : substTokens(m, media, cols); // 同上
-    });
-  }
-  return s;
-}
-
-/** 把新文字合并进旧 HTML：旧媒体节点原位保留，文字块按序替换 */
-export function mergeHtml(oldHtml, newHtml) {
-  const [tok, media, cols] = tokenizeMedia(oldHtml);
-  const oldSegs = parseSegs(tok);
-  const newSegs = parseSegs(newHtml);
-  const newText = newSegs.filter((s) => s[0] === "text").map((s) => s[1]);
-  let ni = 0;
-  const res = [];
-  for (const [t, v] of oldSegs) {
-    if (t === "media") {
-      const m = media[v - 1];
-      res.push(m === undefined ? "" : substTokens(m, media, cols));
-    } else if (t === "col") {
-      const c = cols[v - 1];
-      res.push(c === undefined ? "" : substTokens(c, media, cols));
-    } else {
-      if (ni < newText.length) { res.push(newText[ni]); ni += 1; }
-      else res.push(v); // 新文字不够 → 保留旧文字，不丢内容
-    }
-  }
-  if (ni < newText.length) res.push(...newText.slice(ni)); // 多余新文字补到末尾
-  return res.join("");
 }
 
 /* ---------------- 纯文本提取（page.text 用） ---------------- */
@@ -726,7 +561,7 @@ export async function main() {
   if (!existsSync(DATA_FILE)) die(`找不到 data.js: ${DATA_FILE}`);
   if (FULL && !existsSync(ASSETS_DIR)) mkdirSync(ASSETS_DIR, { recursive: true });
 
-  log(`模式: ${FULL ? "完整重建（含媒体下载）" : "增量同步（保留媒体）"}${DRY ? " + DRY_RUN（不写盘）" : ""}`);
+  log(`模式: 每页全量重建${FULL ? " + 孤儿媒体清理" : ""}${DRY ? " + DRY_RUN（不写盘）" : ""}`);
   log(`读取 ${DATA_FILE}`);
   const { data, prefix, suffix, raw } = loadData();
   const pages = data.pages;
@@ -790,14 +625,15 @@ export async function main() {
   }
 
   const stats = {
-    rebuilt: [], merged: [], added: [], unchanged: [],
+    rebuilt: [], added: [], unchanged: [],
     removed: walkCtx.removedTitles, // removed.txt 黑名单移除（整棵子树）
-    failed: [], newMediaWarn: [], legacy: [], skippedTypes: {},
+    failed: [], legacy: [], skippedTypes: {},
   };
 
-  // 逐页同步
+  // 逐页同步：每页全量重建（媒体按内容哈希命名、已存在即跳过下载，
+  // 因此常规运行零下载；全量重建同时天然清除历史上的合并污染/重复内容）
   for (const [nid, np] of notionPages) {
-    const ctx = { mode: FULL ? "full" : "text", newMedia: [], skipped: [] };
+    const ctx = { mode: "full", newMedia: [], skipped: [] };
     let html;
     try {
       html = await renderBlocks(np.blocks, ctx);
@@ -809,80 +645,18 @@ export async function main() {
     for (const s of ctx.skipped) stats.skippedTypes[s] = (stats.skippedTypes[s] || 0) + 1;
 
     const existing = pages[nid];
-    const hasMedia = existing
-      ? /<figure[\s>]|<video[\s>]|<img[^>]+src="assets\//i.test(existing.html || "")
-      : false;
-
-    // 鸡生蛋修复：无媒体页（含从未同步过的新页面）在 Notion 里出现新媒体时，
-    // 增量模式下只把这一页升级为 full 渲染——下载的仅是这一页的新媒体
-    // （已存在文件由 downloadMedia 的 existsSync 短路，不重复下载）。
-    // 渲染后该页带上媒体节点，此后同步即按媒体页走合并保留，不再依赖整站 FULL_SYNC=1。
-    // 下载失败时该块渲染为空、本页维持文字版，下次同步自动重试（自愈）。
-    if (!FULL && !hasMedia && ctx.newMedia.length) {
-      const kinds = {};
-      for (const m of ctx.newMedia) kinds[m.kind] = (kinds[m.kind] || 0) + 1;
-      const desc = Object.entries(kinds)
-        .map(([k, n]) => `${n} 个${k === "image" ? "图片" : k === "video" ? "视频" : "文件"}`)
-        .join("、");
-      log(`[新媒体] ${np.title}：Notion 新增 ${desc}，自动下载写入`);
-      try {
-        html = await renderBlocks(np.blocks, { mode: "full", newMedia: [], skipped: [] });
-        ctx.newMedia = []; // 已处理，不再计入 newMediaWarn
-      } catch (e) {
-        warn(`[新媒体升级失败] ${np.title}: ${e.message} — 本页维持文字版，下次同步重试`);
-      }
-    }
-
     if (existing) {
-      let newHtml;
-      let rebuiltByGuard = false;
-      // 旧数据污染（历史 bug 曾把 @@MED token 写进 data.js）：残留 token 的页面
-      // 无法靠合并自愈（媒体节点已不在旧 html 里），直接升级完整重建
-      const oldCorrupt = /@@(MED|COL)\d+@@/.test(existing.html || "");
-      if (!FULL && oldCorrupt) {
-        warn(`[旧数据损坏] ${np.title}：旧 html 残留占位符，本页升级为完整重建`);
-        try {
-          newHtml = await renderBlocks(np.blocks, { mode: "full", newMedia: [], skipped: [] });
-          rebuiltByGuard = true;
-          ctx.newMedia = []; // 媒体已进 html，不再计入 newMediaWarn
-        } catch (e) {
-          warn(`[完整重建失败] ${np.title}: ${e.message} — 保留旧内容，下次同步重试`);
-          newHtml = existing.html;
-        }
-      } else if (!hasMedia || FULL) {
-        newHtml = html;
-      } else {
-        newHtml = mergeHtml(existing.html, html); // 媒体页：文字合并、媒体保留
-        // 保险丝：合并结果若仍残留占位符（异常嵌套等极端情况），
-        // 本页升级为完整重建——保证 @@MED/@@COL token 永远不落进 data.js
-        if (/@@(MED|COL)\d+@@/.test(newHtml)) {
-          warn(`[合并异常] ${np.title}：合并结果仍含占位符，本页升级为完整重建`);
-          try {
-            newHtml = await renderBlocks(np.blocks, { mode: "full", newMedia: [], skipped: [] });
-            rebuiltByGuard = true;
-            ctx.newMedia = [];
-          } catch (e) {
-            warn(`[完整重建失败] ${np.title}: ${e.message} — 保留旧内容，不下发损坏结果`);
-            newHtml = existing.html;
-          }
-        }
-      }
+      const newHtml = html;
       const newText = textOf(newHtml).slice(0, 6000);
       const titleChanged = np.title && np.title !== existing.title;
       if (existing.html === newHtml && existing.text === newText && !titleChanged) {
         stats.unchanged.push(np.title);
-        if (ctx.newMedia.length && !FULL) {
-          stats.newMediaWarn.push(`  ${np.title}: Notion 新增 ${ctx.newMedia.length} 个媒体（需 FULL 重建后显示）`);
-        }
         continue;
       }
       existing.html = newHtml;
       existing.text = newText;
       if (np.title) existing.title = np.title;
-      (hasMedia && !FULL && !rebuiltByGuard ? stats.merged : stats.rebuilt).push(np.title);
-      if (ctx.newMedia.length && !FULL) {
-        stats.newMediaWarn.push(`  ${np.title}: Notion 新增 ${ctx.newMedia.length} 个媒体（需 FULL 重建后显示）`);
-      }
+      stats.rebuilt.push(np.title);
     } else {
       // 新页面
       let tags = [];
@@ -946,16 +720,11 @@ export async function main() {
 
   // 汇总日志
   log("\n========== 同步结果 ==========");
-  log(`整页重建 ${stats.rebuilt.length} | 文字合并 ${stats.merged.length} | 新增 ${stats.added.length} | 移除 ${stats.removed.length} | 未变化 ${stats.unchanged.length} | 失败 ${stats.failed.length}`);
+  log(`整页重建 ${stats.rebuilt.length} | 新增 ${stats.added.length} | 移除 ${stats.removed.length} | 未变化 ${stats.unchanged.length} | 失败 ${stats.failed.length}`);
   if (stats.rebuilt.length) log("重建: " + stats.rebuilt.join("、"));
-  if (stats.merged.length) log("合并: " + stats.merged.join("、"));
   if (stats.added.length) log("新增: " + stats.added.join("、"));
   if (stats.removed.length) log("移除（removed.txt 黑名单，整棵子树）: " + stats.removed.join("、"));
   if (stats.failed.length) log("失败: " + stats.failed.join("、"));
-  if (stats.newMediaWarn.length) {
-    log("新媒体提醒（有媒体页新增的媒体，增量不下载，FULL 重建后显示；无媒体页/新页面已自动下载）:");
-    stats.newMediaWarn.forEach((l) => log(l));
-  }
   if (stats.legacy.length) {
     log(`仅存在于网站的旧页面（Notion 已无；内容保留、可直链访问，未进树）: ${stats.legacy.length} 个`);
     for (const l of stats.legacy) log("  - " + l);
